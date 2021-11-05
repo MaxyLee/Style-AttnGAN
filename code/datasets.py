@@ -352,3 +352,165 @@ class ImageFolderDataset( data.Dataset ):
     
     def __len__( self ):
         return len( self.img_paths )
+
+class MMCelebADataset(data.Dataset):
+    def __init__(self, 
+                root, 
+                split, 
+                transform=None,
+                target_transform=None
+                base_size=64,
+                max_txt_len=50):
+        assert split in ['train', 'test']
+        self.root = root
+        self.split = split
+        self.transform = transform
+        self.norm = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        self.target_transform = target_transform
+
+        self.imsize = []
+        for i in range(cfg.TREE.BRANCH_NUM):
+            self.imsize.append(base_size)
+            base_size = base_size * 2
+
+        self.filenames, self.captions, self.ixtoword, \
+            self.wordtoix, self.n_words = self.load_text_data(root, split)
+
+        # spilt_file = f'{root}/train_filenames.pickle' if split == 'train' else f'{root}/test_filenames.pickle'
+        # with open(spilt_file, 'rb') as f:
+        #     self.filenames = pickle.load(f)
+
+        # for fn in tqdm(self.filenames, desc='Initializing'):
+        #     with open(f'{root}/celeba-caption/{fn}.txt', 'r') as f:
+        #         self.captions[fn] = f.read().splitlines()
+        # self.images = ImagePaths(paths=image_paths, size=size, random_crop=False)
+
+    def load_captions(self, data_dir, filenames):
+        all_captions = []
+        for i in range(len(filenames)):
+            cap_path = '%s/celeba-caption/%s.txt' % (data_dir, filenames[i])
+            with open(cap_path, "r") as f:
+                captions = f.read().decode('utf8').split('\n')
+                cnt = 0
+                for cap in captions:
+                    if len(cap) == 0:
+                        continue
+                    cap = cap.replace("\ufffd\ufffd", " ")
+                    # picks out sequences of alphanumeric characters as tokens
+                    # and drops everything else
+                    tokenizer = RegexpTokenizer(r'\w+')
+                    tokens = tokenizer.tokenize(cap.lower())
+                    # print('tokens', tokens)
+                    if len(tokens) == 0:
+                        print('cap', cap)
+                        continue
+
+                    tokens_new = []
+                    for t in tokens:
+                        t = t.encode('ascii', 'ignore').decode('ascii')
+                        if len(t) > 0:
+                            tokens_new.append(t)
+                    all_captions.append(tokens_new)
+                    cnt += 1
+                    if cnt == self.embeddings_num:
+                        break
+                if cnt < self.embeddings_num:
+                    print('ERROR: the captions for %s less than %d'
+                          % (filenames[i], cnt))
+        return all_captions
+
+    def build_dictionary(self, train_captions, test_captions):
+        word_counts = defaultdict(float)
+        captions = train_captions + test_captions
+        for sent in captions:
+            for word in sent:
+                word_counts[word] += 1
+
+        vocab = [w for w in word_counts if word_counts[w] >= 0]
+
+        ixtoword = {}
+        ixtoword[0] = '<end>'
+        wordtoix = {}
+        wordtoix['<end>'] = 0
+        ix = 1
+        for w in vocab:
+            wordtoix[w] = ix
+            ixtoword[ix] = w
+            ix += 1
+
+        train_captions_new = []
+        for t in train_captions:
+            rev = []
+            for w in t:
+                if w in wordtoix:
+                    rev.append(wordtoix[w])
+            # rev.append(0)  # do not need '<end>' token
+            train_captions_new.append(rev)
+
+        test_captions_new = []
+        for t in test_captions:
+            rev = []
+            for w in t:
+                if w in wordtoix:
+                    rev.append(wordtoix[w])
+            # rev.append(0)  # do not need '<end>' token
+            test_captions_new.append(rev)
+
+        return [train_captions_new, test_captions_new,
+                ixtoword, wordtoix, len(ixtoword)]
+
+    def load_text_data(self, data_dir, split):
+        filepath = os.path.join(data_dir, 'captions.pickle')
+        train_names = self.load_filenames(data_dir, 'train')
+        test_names = self.load_filenames(data_dir, 'test')
+        if not os.path.isfile(filepath):
+            train_captions = self.load_captions(data_dir, train_names)
+            test_captions = self.load_captions(data_dir, test_names)
+
+            train_captions, test_captions, ixtoword, wordtoix, n_words = \
+                self.build_dictionary(train_captions, test_captions)
+            with open(filepath, 'wb') as f:
+                pickle.dump([train_captions, test_captions,
+                             ixtoword, wordtoix], f, protocol=2)
+                print('Save to: ', filepath)
+        else:
+            with open(filepath, 'rb') as f:
+                x = pickle.load(f)
+                train_captions, test_captions = x[0], x[1]
+                ixtoword, wordtoix = x[2], x[3]
+                del x
+                n_words = len(ixtoword)
+                print('Load from: ', filepath)
+        if split == 'train':
+            # a list of list: each list contains
+            # the indices of words in a sentence
+            captions = train_captions
+            filenames = train_names
+        else:  # split=='test'
+            captions = test_captions
+            filenames = test_names
+        return filenames, captions, ixtoword, wordtoix, n_words
+
+    def load_filenames(self, data_dir, split):
+        filepath = '%s/%s_filenames.pickle' % (data_dir, split)
+        with open(filepath, 'rb') as f:
+            filenames = pickle.load(f)
+            print('Load filenames from: %s (%d)' % (filepath, len(filenames)))
+        return filenames
+
+    def __getitem__(self, index):
+        key = self.filenames[index]
+        cls_id = int(key)
+        img_name = '%s/CelebAMask-HQ/CelebA-HQ-img/%s.jpg' % (self.root, key)
+        imgs = get_imgs(img_name, self.imsize,
+                        bbox=None, self.transform, normalize=self.norm)
+        # random select a sentence
+        sent_ix = random.randint(0, self.embeddings_num)
+        new_sent_ix = index * self.embeddings_num + sent_ix
+        caps, cap_len = self.get_caption(new_sent_ix)
+        return imgs, caps, cap_len, cls_id, key
+
+    def __len__(self):
+        return len(self.filenames)
